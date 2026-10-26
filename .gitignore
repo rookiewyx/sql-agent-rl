@@ -1,0 +1,10 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+data/raw/*
+!data/raw/README.md
+data/sample_synthetic/
+data/load_manifest.json
+data/profile_result.json
