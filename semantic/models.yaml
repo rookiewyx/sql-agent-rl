@@ -1,0 +1,21 @@
+# 语义层：宽表模型的粒度、主键与关联关系
+# 由 python -m semantic.models 对照数据库核对
+
+order_item:
+  table: dws.order_item
+  grain: 一条订单明细
+  primary_key: [order_id, order_item_id]
+
+order_category:
+  table: dws.order_category
+  grain: 一笔订单中的一个类目
+  primary_key: [order_id, category]
+
+review:
+  table: dws.review
+  grain: 一条评价
+  primary_key: [review_id, order_id]
+  joins:
+    order_category:
+      keys: {order_id: order_id}    # 左表列: 右表列
+      cardinality: many_to_many      # 一笔订单可能有多个类目
