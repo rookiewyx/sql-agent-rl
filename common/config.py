@@ -16,7 +16,7 @@ load_dotenv(ENV_FILE)
 
 def database_url() -> str:
     return os.environ.get(
-        "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/sqlagent"
+        "DATABASE_URL", "postgresql://postgres:postgres@127.0.0.1:5432/sqlagent"
     )
 
 
