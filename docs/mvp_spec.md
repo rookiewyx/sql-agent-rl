@@ -1,4 +1,4 @@
-# MVP 实现说明
+# MVP 实现说明（v0.5）
 
 > 对应 README §12 P0。本文是首个版本的实现依据，可以直接交给编码 Agent 按顺序实现。凡与 README 冲突之处，以本文为准，并同步修正 README。
 
@@ -7,8 +7,10 @@
 ### 0.1 MVP 要演示的完整流程
 
 ```
-提问 → 必要时澄清 → 选择指标路径或 SQL 路径 → 执行 → 展示结果与口径 → 追问修改条件
+提问 → 必要时澄清 → 选择指标路径或 SQL 路径 → 执行 → 在界面展示结果、口径与条件 → 追问修改条件或引用上一轮结果
 ```
+
+MVP 完成时应达到 README §12 验收标准的第 1 条：完整的产品演示可以在界面上连续运行。
 
 ### 0.2 范围
 
@@ -19,10 +21,11 @@
 | 2 个维度（类目、客户州）+ 时间 | 卖家州等其他维度 |
 | 指标路径与 SQL 路径 | 混合检索、示例库、反馈闭环 |
 | 护栏：只读、单条 SELECT、函数白名单、LIMIT、超时 | 执行计划检查、RLS |
-| `confirmed_context` 更新与持久化 | 上下文压缩、缓存 |
+| `confirmed_context`：更新操作、持久化、指代、比较基准 | 上下文压缩、缓存 |
 | `/tasks`、`/events`、`/reply`、`/sessions` | 幂等、续传、取消、反馈接口 |
+| Streamlit 演示界面：对话、条件面板、结果与 SQL | 界面上的取消、重连、历史与反馈 |
 | API 模型 + 小模型推理端点 | SFT、RL |
-| 约 20 道开发题、约 5 组多轮对话、冻结测试集 | 鲁棒性集、安全集、回归门禁 |
+| 约 20 道开发题、约 6 组多轮对话、冻结测试集 | 鲁棒性集、安全集、回归门禁 |
 
 ### 0.3 配置项（`.env`）
 
@@ -35,6 +38,7 @@
 | `ROW_LIMIT` | 1000 | 自动追加的 LIMIT 上限 |
 | `RESULT_PREVIEW_ROWS` | 20 | 返回给模型的结果预览行数 |
 | `MODEL_ENDPOINT` / `MODEL_NAME` | — | 模型网关后端（API 模型或 vLLM） |
+| `API_BASE_URL` | `http://localhost:8000` | 演示界面调用的 API 地址 |
 
 ## 1. 数据导入与数据画像
 
@@ -63,26 +67,28 @@
 | P2 | `order_items (order_id, order_item_id)` 唯一 | 期望唯一 |
 | P3 | `customers.customer_id` 唯一 | 期望唯一（注意 `customer_unique_id` 才代表同一位顾客，MVP 不使用） |
 | P4 | `products.product_id` 唯一；`product_category_name` 的空值数 | 空值类目在宽表中记为 `unknown` |
-| P5 | 类目翻译覆盖率：有商品但没有英文翻译的类目 | 无翻译时保留原始葡萄牙语名称 |
+| P5 | 类目翻译覆盖率：有商品但没有英文翻译的类目；翻译表的键是否唯一 | 无翻译时保留原始葡萄牙语名称；翻译表键不唯一会导致左关联扇出 |
 | P6 | `order_reviews`：`review_id` 是否唯一；`(review_id, order_id)` 是否唯一；每笔订单的评价数分布；`review_score` 空值数 | 若 `(review_id, order_id)` 不唯一，按 `review_answer_timestamp` 保留最新一条，并记录去重数量 |
 | P7 | `order_status` 的取值与数量 | 确认 `canceled`、`unavailable` 的确切取值，写入指标定义 |
 | P8 | `order_purchase_timestamp` 的最小值、最大值与月度订单数 | 用于确定 `REFERENCE_DATE` |
-| P9 | 参照完整性：明细的 `order_id` 都存在于订单表；订单的 `customer_id` 都存在于客户表；明细的 `product_id`、`seller_id` 都存在 | 不满足的记录数写入画像报告 |
+| P9 | 参照完整性：明细的 `order_id` 都存在于订单表；订单的 `customer_id` 都存在于客户表；明细的 `product_id`、`seller_id` 都存在 | 不满足的记录数写入画像报告；同时计算 DWS 宽表的预期行数 |
 | P10 | 没有任何明细的订单数，以及这些订单上的评价数 | 用于说明差评率按类目拆分时的覆盖范围（§3.2） |
 
 ### 1.3 `REFERENCE_DATE` 的确定规则
 
 数据尾部的月份可能只有零星订单。规则如下：
 
-1. 计算每个自然月的订单数；
+1. 计算每个自然月的订单数（首末月之间缺失的月份记为 0）；
 2. 从最后一个月往前找，第一个订单数不低于"其之前 6 个月订单数中位数"一半的月份，记为**最后一个完整月**；
 3. `REFERENCE_DATE` = 最后一个完整月的**次月 1 日**。
 
 因此"上个月"就是最后一个完整月；"本月"指 `REFERENCE_DATE` 所在月，数据不完整，按 §5 的 `OUT_OF_SCOPE` 处理。确定的日期写入 `.env` 与 `docs/data_profile.md`。
 
+在真实 Olist 数据上按此规则得到的预期值为 `2018-09-01`，以画像脚本的实际输出为准。本文的时间示例均按这个日期计算。
+
 ## 2. 宽表（`data/warehouse/`、`semantic/models.yaml`）
 
-只允许 N:1 关联；每张表构建后执行**行数断言与唯一键断言**，断言失败则构建失败。
+只允许 N:1 关联；每张表构建后执行**行数断言与唯一键断言**，断言失败则构建失败。预期行数来自画像 P9 的结果。
 
 ### 2.1 `dws.order_item`
 
@@ -100,7 +106,9 @@ SELECT
     o.customer_id,
     c.customer_state,
     s.seller_state,
-    COALESCE(t.product_category_name_english, p.product_category_name, 'unknown') AS category,
+    COALESCE(t.product_category_name_english,
+             NULLIF(trim(p.product_category_name), ''),
+             'unknown')                       AS category,
     o.order_status,
     o.order_purchase_timestamp       AS purchase_ts,
     o.order_delivered_customer_date  AS delivered_ts,
@@ -117,7 +125,7 @@ LEFT JOIN ods.category_translation t
 ALTER TABLE dws.order_item ADD PRIMARY KEY (order_id, order_item_id);
 ```
 
-**断言：** `COUNT(*) FROM dws.order_item` = `COUNT(*) FROM ods.order_items` 中通过参照完整性检查的记录数（P9）。
+**断言：** `COUNT(*) FROM dws.order_item` = 画像 P9 给出的 `expected_dws_order_item_rows`。
 
 ### 2.2 `dws.order_category`（桥接表）
 
@@ -136,10 +144,18 @@ ALTER TABLE dws.order_category ADD PRIMARY KEY (order_id, category);
 ### 2.3 `dws.review`
 
 - **行粒度：** 一条评价；
-- **唯一键：** `(review_id, order_id)`（以 P6 的画像结果为准，必要时先去重）；
+- **唯一键：** `(review_id, order_id)`；
 - **关联：** `order_reviews` →（N:1）`orders` →（N:1）`customers`。
 
+先建立去重视图。即使画像显示没有重复，也保留这一步，用于防御后续数据：
+
 ```sql
+CREATE OR REPLACE VIEW ods.order_reviews_dedup AS
+SELECT DISTINCT ON (review_id, order_id) *
+FROM ods.order_reviews
+WHERE review_id IS NOT NULL AND order_id IS NOT NULL
+ORDER BY review_id, order_id, review_answer_timestamp DESC NULLS LAST;
+
 CREATE TABLE dws.review AS
 SELECT
     r.review_id,
@@ -148,12 +164,14 @@ SELECT
     r.review_creation_date AS review_created_ts,
     o.order_status,
     c.customer_state
-FROM ods.order_reviews_dedup r          -- 按 P6 去重后的视图或表
+FROM ods.order_reviews_dedup r
 JOIN ods.orders o    ON o.order_id = r.order_id
 JOIN ods.customers c ON c.customer_id = o.customer_id;
 
 ALTER TABLE dws.review ADD PRIMARY KEY (review_id, order_id);
 ```
+
+**断言：** `COUNT(*) FROM dws.review` = 画像 P9 给出的 `expected_dws_review_rows`。
 
 ### 2.4 `semantic/models.yaml`
 
@@ -276,14 +294,15 @@ customer_state:
   "filters": {"customer_state": {"op": "in", "values": ["SP"]}},
   "time_range": {"start": "2018-04-01", "end": "2018-07-01"},
   "compare_to": {"start": "2018-01-01", "end": "2018-04-01"},
-  "order_by": {"field": "value", "dir": "desc"},
+  "order_by": {"field": "delta", "dir": "asc"},
   "limit": 10
 }
 ```
 
 - MVP 中每次查询只有一个指标；
 - 时间区间为左闭右开，`start` 含、`end` 不含；
-- `time_range` 与 `compare_to` 只接受程序解析后的绝对日期（§6.3），模型不直接写日期。
+- `time_range` 与 `compare_to` 只接受程序解析后的绝对日期（§6.3），模型不直接写日期；
+- `order_by.field` 可取 `value`、`value_current`、`value_compare`、`delta`、`delta_pct`；"下降最多"对应 `delta` 升序，"增长最多"对应 `delta` 降序。
 
 ### 4.4 编译规则（`semantic/compiler.py`）
 
@@ -293,22 +312,29 @@ customer_state:
 4. 比率类指标：同时输出 `numerator`、`denominator`、`value = numerator / NULLIF(denominator, 0)`；
 5. 存在 `compare_to` 时，用带 `FILTER` 的条件聚合在同一条 SQL 中分别计算两个时间段，外层再计算差值与变化率；
 6. 经桥接表关联时，在返回结果中附带归属规则与 `additive_across: false` 标记；
-7. 用 sqlglot 构建 SQL，不做字符串拼接；
-8. 返回 `{sql, explanation, error_code?}`；编译器内部异常返回 `COMPILER_ERROR`，不得被调用方当作 `NOT_COVERED` 处理。
+7. 排序时加入维度列作为第二排序键，保证结果顺序确定；
+8. 用 sqlglot 构建 SQL，不做字符串拼接；
+9. 返回 `{sql, explanation, error_code?}`；编译器内部异常返回 `COMPILER_ERROR`，不得被调用方当作 `NOT_COVERED` 处理。
 
-**编译结果示例**（类目销售额，圣保罗州，上季度对比再上一季度）：
+**编译结果示例**（类目销售额，圣保罗州，上季度对比再上一季度，按下降幅度排序）：
 
 ```sql
-SELECT
-    category,
-    SUM(item_price) FILTER (WHERE purchase_ts >= '2018-04-01' AND purchase_ts < '2018-07-01') AS value_current,
-    SUM(item_price) FILTER (WHERE purchase_ts >= '2018-01-01' AND purchase_ts < '2018-04-01') AS value_compare
-FROM dws.order_item
-WHERE order_status NOT IN ('canceled', 'unavailable')
-  AND customer_state IN ('SP')
-  AND purchase_ts >= '2018-01-01' AND purchase_ts < '2018-07-01'
-GROUP BY category
-ORDER BY value_current DESC NULLS LAST
+WITH t AS (
+    SELECT
+        category,
+        SUM(item_price) FILTER (WHERE purchase_ts >= '2018-04-01' AND purchase_ts < '2018-07-01') AS value_current,
+        SUM(item_price) FILTER (WHERE purchase_ts >= '2018-01-01' AND purchase_ts < '2018-04-01') AS value_compare
+    FROM dws.order_item
+    WHERE order_status NOT IN ('canceled', 'unavailable')
+      AND customer_state IN ('SP')
+      AND purchase_ts >= '2018-01-01' AND purchase_ts < '2018-07-01'
+    GROUP BY category
+)
+SELECT category, value_current, value_compare,
+       COALESCE(value_current, 0) - COALESCE(value_compare, 0) AS delta,
+       (COALESCE(value_current, 0) - value_compare) / NULLIF(value_compare, 0) AS delta_pct
+FROM t
+ORDER BY delta ASC, category
 LIMIT 10;
 ```
 
@@ -325,7 +351,7 @@ FROM dws.review r
 JOIN dws.order_category oc ON oc.order_id = r.order_id
 WHERE r.review_created_ts >= '2018-04-01' AND r.review_created_ts < '2018-07-01'
 GROUP BY oc.category
-ORDER BY value DESC NULLS LAST
+ORDER BY value DESC NULLS LAST, oc.category
 LIMIT 10;
 ```
 
@@ -333,17 +359,19 @@ LIMIT 10;
 
 ### 5.1 流程
 
-1. 模型调用 `list_metrics` 后输出结构化意图：候选指标、分组维度、筛选条件、时间表达式、识别出的歧义点；
-2. 程序检查：存在未解决的歧义点 → `AMBIGUOUS`；
-3. 存在候选指标 → 调用编译器，按错误码处理；
-4. 不存在候选指标、问题与数据相关且业务含义明确 → `NOT_COVERED`，进入 SQL 路径；
-5. 问题所需的数据不存在（例如利润，数据中没有成本信息），或时间范围超出数据覆盖范围 → `OUT_OF_SCOPE`。
+1. 模型调用 `list_metrics` 后输出结构化意图：候选指标、分组维度、筛选条件、时间表达式、对比表达式、指代、是否询问单个实体（`expects_single_entity`）、识别出的歧义点；
+2. 意图中包含指代（"这个 / 该 + 维度"）时，程序按 §6.5 解析；无法唯一解析 → `AMBIGUOUS`；
+3. 意图是比较类问题（增长、下降、变化最多）且没有对比期时，程序按 §6.6 声明默认对比期，**不作为歧义**；
+4. 存在未解决的口径歧义 → `AMBIGUOUS`；
+5. 存在候选指标 → 调用编译器，按错误码处理；
+6. 不存在候选指标、问题与数据相关且业务含义明确 → `NOT_COVERED`，进入 SQL 路径；
+7. 问题所需的数据不存在（例如利润，数据中没有成本信息），或时间范围超出数据覆盖范围 → `OUT_OF_SCOPE`。
 
 ### 5.2 错误码与行为
 
 | 错误码 | 情况 | 行为 | 题目类别 |
 | --- | --- | --- | --- |
-| `AMBIGUOUS` | 口径存在影响结果的歧义 | 澄清，任务进入 `waiting_user` | `must_clarify` |
+| `AMBIGUOUS` | 口径存在影响结果的歧义，或指代无法唯一解析 | 澄清，任务进入 `waiting_user` | `must_clarify` |
 | `NOT_COVERED` | 不涉及已定义指标，业务含义明确 | 进入 SQL 路径，沿用已确认的口径 | `long_tail_sql` |
 | `INCOMPATIBLE` | 涉及已定义指标，但维度或拆分方式不支持 | **不回退到 SQL**；说明限制，给出兼容的替代口径；记录为语义层待新增项 | `unsupported` |
 | `INVALID_VALUE` | 筛选取值不存在 | 列出相近的合法取值，请用户确认 | — |
@@ -356,7 +384,7 @@ LIMIT 10;
 
 - 只能访问 `dws` schema 中的表，不能访问 `ods`（数据库权限层面不授予）；
 - 使用与指标路径相同的数据库角色、护栏与 `REFERENCE_DATE`；
-- 提示词中提供：DWS 表的结构与字段说明、当前 `confirmed_context`、解析后的绝对时间范围；
+- 提示词中提供：DWS 表的结构与字段说明、当前 `confirmed_context`、解析后的绝对时间范围与指代结果；
 - 时间条件必须使用程序解析出的绝对日期，`CURRENT_DATE`、`NOW()` 等函数被护栏拒绝；
 - 执行报错后最多修复 `MAX_SQL_REPAIR` 次；
 - 答案必须列出所采用的口径假设，并以 `default_declared` 状态写入 `confirmed_context`。
@@ -365,7 +393,7 @@ LIMIT 10;
 
 ### 6.1 结构
 
-在 README §7.1 的 `ConfirmedContext` 基础上，`rules` 中的每条口径带有来源：
+使用 README §7.1 定义的 `ConfirmedContext`，包含 `last_result`。`rules` 中的每条口径带有来源：
 
 ```python
 class Rule(TypedDict):
@@ -375,7 +403,7 @@ class Rule(TypedDict):
 
 ### 6.2 更新操作
 
-按 README §7.1 的操作表实现：`set_filter`、`add_filter_values`、`remove_filter`、`set_time_range`、`set_compare_to`、`clear_compare`、`set_metrics`、`set_group_by`。每个操作在应用前由程序校验：维度存在、取值合法、与当前指标兼容；校验失败的操作不应用，并返回给模型说明原因。
+按 README §7.1 的操作表实现：`set_filter`、`add_filter_values`、`remove_filter`、`set_time_range`、`set_compare_to`、`clear_compare`、`bind_reference`、`set_metrics`、`set_group_by`。每个操作在应用前由程序校验：维度存在、取值合法、与当前指标兼容；校验失败的操作不应用，并返回给模型说明原因。
 
 ### 6.3 时间表达式
 
@@ -388,7 +416,8 @@ class Rule(TypedDict):
 | `last_n_months(n)` | 最近 3 个月 | 2018-06-01 至 2018-09-01 |
 | `absolute_month(y, m)` | 2018 年 3 月 | 2018-03-01 至 2018-04-01 |
 | `absolute_quarter(y, q)` | 2018 年第一季度 | 2018-01-01 至 2018-04-01 |
-| `previous_period` | 再上一季度（相对当前 `time_range`） | 当前为 Q2 时，解析为 2018-01-01 至 2018-04-01 |
+| `previous_period` | 再上一期（相对当前 `time_range`，长度相同） | 当前为 2018 Q2 时，解析为 2018-01-01 至 2018-04-01 |
+| `year_over_year` | 去年同期（当前 `time_range` 平移 12 个月） | 当前为 2018 Q2 时，解析为 2017-04-01 至 2017-07-01 |
 
 `month(0)`、`quarter(0)` 等指向数据不完整的时间段时，返回 `OUT_OF_SCOPE`。
 
@@ -396,8 +425,34 @@ class Rule(TypedDict):
 
 - 表 `app.session_context(session_id, version, context_json, source_task_id, created_at)`，只追加，不覆盖；
 - 用户通过 `/tasks/{id}/reply` 回复后，Agent 的第一个节点 `apply_reply` 将回复解析为更新操作，校验后**在执行任何查询之前**写入新版本；
-- Agent 声明默认口径时，以 `default_declared` 写入；用户之后明确确认或修改时，更新为 `user_confirmed` 或替换；
+- Agent 声明默认口径或默认对比期时，以 `default_declared` 写入；用户之后明确确认或修改时，更新为 `user_confirmed` 或替换；
+- 每次给出答案后，写入本轮的 `last_result`，产生一个新版本；
+- 每次写入新版本时，计算与上一版本的差异，通过 SSE 的 `context_update` 事件推送（§8.2）；
 - 答案的口径说明中记录所依据的 `version`。
+
+### 6.5 指代解析（`bind_reference`）
+
+**写入 `last_result` 的规则（`answer` 节点）：**
+
+- `dimension`：本轮结果的分组维度；`group_by` 恰好有一个维度时取该维度，否则为空；
+- `entities`：按结果顺序排列的该维度取值；
+- `selected`：意图中 `expects_single_entity` 为真（"最高的""下降最多的""哪个"）且结果第一名唯一时，取第一行的维度取值；第一名并列，或问题询问的是多个实体（"前 5 个"）时为空。
+
+**解析规则：**
+
+| 情况 | 行为 |
+| --- | --- |
+| `last_result.selected` 存在，且 `dimension` 与指代的维度一致 | 转换为 `set_filter(dim, in [selected])`；口径说明写明"'这个类目'指 X" |
+| `selected` 为空，`entities` 有多个 | `AMBIGUOUS`：列出候选（最多 5 个）请用户选择 |
+| `dimension` 与指代的维度不一致 | `AMBIGUOUS` |
+| 没有 `last_result` | `AMBIGUOUS` |
+
+### 6.6 比较类问题的基准
+
+- 意图为比较类问题（增长、下降、变化最多），且 `compare_to` 为空时，按 `previous_period` 设置 `compare_to`，并写入一条 `default_declared` 口径："变化默认与相同长度的上一期比较"；
+- 声明的默认对比期必须出现在答案的口径说明和界面的条件面板中；
+- 用户随后说"和去年同期比"时，执行 `set_compare_to(year_over_year)`，口径来源改为 `user_confirmed`；
+- 意图不是比较类问题时，不设置 `compare_to`。
 
 ## 7. 护栏（`mcp_server/guard.py`）
 
@@ -423,7 +478,7 @@ class Rule(TypedDict):
 
 **`run_sql` 的错误码：** `NOT_SELECT`、`MULTI_STATEMENT`、`FUNCTION_NOT_ALLOWED`、`SYSTEM_CATALOG`、`SQL_SYNTAX`、`UNKNOWN_TABLE`、`UNKNOWN_COLUMN`、`TIMEOUT`、`PERMISSION_DENIED`。错误信息要足够具体，让模型可以据此修复。
 
-## 8. API 与事件（P0）
+## 8. API、事件与演示界面（P0）
 
 ### 8.1 接口
 
@@ -432,7 +487,7 @@ class Rule(TypedDict):
 | POST | `/tasks` | `{question, db_id, session_id?}` | `{task_id, session_id}` |
 | GET | `/tasks/{id}` | — | 任务状态与最终答案 |
 | GET | `/tasks/{id}/events` | — | SSE 事件流 |
-| POST | `/tasks/{id}/reply` | `{text}` | `{status}` |
+| POST | `/tasks/{id}/reply` | `{text}` 或 `{choice}` | `{status}` |
 | GET | `/sessions/{id}` | — | 会话历史与最新的 `confirmed_context` |
 | GET | `/health` | — | 健康检查 |
 
@@ -441,33 +496,63 @@ class Rule(TypedDict):
 | 事件 | 内容 |
 | --- | --- |
 | `status` | 任务状态变化 |
-| `clarification` | 澄清问题与可选项 |
+| `clarification` | 澄清问题与可选项（如指代的候选实体） |
 | `tool_call` | 工具名与参数摘要 |
 | `tool_result` | 结果摘要或错误码 |
+| `context_update` | 新版本号，以及与上一版本的差异：`added`、`changed`、`removed`，每项带来源（`user_confirmed` / `default_declared`） |
 | `answer` | 最终答案 |
 | `error` | 任务级错误 |
+
+`context_update` 示例：
+
+```json
+{
+  "version": 4,
+  "diff": {
+    "added":   [{"field": "filters.customer_state", "value": {"op": "in", "values": ["SP"]}, "source": "user_confirmed"}],
+    "changed": [],
+    "removed": []
+  }
+}
+```
 
 ### 8.3 答案结构
 
 ```json
 {
-  "summary": "上季度圣保罗州销售额下降最多的类目是 ...",
+  "summary": "上季度销售额下降最多的类目是 ...",
   "table": {"columns": ["category", "value_current", "value_compare", "delta", "delta_pct"], "rows": [["...", 0, 0, 0, 0]]},
   "explanation": {
     "path": "metric",
     "metric": {"id": "category_sales", "definition": "销售额按商品金额统计，不含运费，不含已取消和不可用的订单，按下单时间归属"},
     "attribution": null,
+    "reference": null,
     "source_tables": ["dws.order_item"],
-    "filters": {"customer_state": {"op": "in", "values": ["SP"]}},
+    "filters": {},
     "time_range": {"expr": "上季度", "start": "2018-04-01", "end": "2018-07-01"},
-    "compare_to": {"expr": "再上一季度", "start": "2018-01-01", "end": "2018-04-01"},
-    "assumptions": [],
-    "sql": "SELECT ...",
+    "compare_to": {"expr": "再上一期（默认）", "start": "2018-01-01", "end": "2018-04-01", "source": "default_declared"},
+    "assumptions": ["变化默认与相同长度的上一期比较"],
+    "sql": "WITH t AS (...) SELECT ...",
     "reference_date": "2018-09-01",
     "context_version": 3
   }
 }
 ```
+
+指代被解析时，`reference` 为 `{"expr": "这个类目", "dimension": "category", "value": "...", "from_version": 3}`。
+
+### 8.4 演示界面（`ui/app.py`）
+
+用 Streamlit 实现，**只通过 HTTP / SSE 调用 API**，不导入 Agent 代码。
+
+| 区域 | 内容 |
+| --- | --- |
+| 对话区 | 多轮对话；`clarification` 事件的可选项显示为按钮，点击后调用 `/reply` |
+| 条件面板 | 显示当前 `confirmed_context`：指标、口径、筛选、时间范围、对比期、上一轮结果的选中实体；收到 `context_update` 时，新增的条目标绿、修改的标黄、删除的以删除线显示一轮；每条标注来源（"你确认的" / "系统默认"） |
+| 结果区 | 结果表格；可展开查看 SQL 与完整口径说明；指代被解析时显示"'这个类目'指 X" |
+| 执行过程 | 按时间顺序显示 `status`、`tool_call`、`tool_result` 事件 |
+
+界面不实现任何业务逻辑：条件的变化完全来自 `context_update` 事件，界面只负责展示。这样界面显示的就是后端真实的状态。
 
 ## 9. 首批测试用例
 
@@ -497,7 +582,7 @@ O1 另有一条付款记录 160（含运费），用于确认付款金额**不�
 | U7 | 差评率，按类目 | electronics：分子 1、分母 2、值 0.5；toys：分子 1、分母 1、值 1.0；结果带 `additive_across: false` |
 | U8 | 差评率，分母为 0 的范围 | 值为空，附带"没有有效评分"说明 |
 | U9 | 时间边界 | `end` 当天的数据不计入（左闭右开） |
-| U10 | `compare_to` | 同时返回两个时间段的值，差值与变化率计算正确 |
+| U10 | `compare_to` | 同时返回两个时间段的值，差值与变化率计算正确；按 `delta` 升序排序 |
 | U11 | 非法筛选取值（不存在的州） | 返回 `INVALID_VALUE` |
 | U12 | 编译器内部异常（注入） | 返回 `COMPILER_ERROR`，不被当作 `NOT_COVERED` |
 
@@ -513,6 +598,14 @@ O1 另有一条付款记录 160（含运费），用于确认付款金额**不�
 | C6 | `set_filter` 使用不存在的维度 | 拒绝，状态不变 |
 | C7 | 每次成功更新 | `version` 加 1，旧版本保留 |
 | C8 | 回复澄清后、执行查询前模拟进程退出 | 重启后数据库中已有新版本的 `confirmed_context` |
+| C9 | `last_result` 维度为 category、`selected` 为 X，`bind_reference(category)` | 筛选变为 category in [X] |
+| C10 | `last_result` 有 5 个实体、`selected` 为空，`bind_reference(category)` | `AMBIGUOUS`，候选为这 5 个实体 |
+| C11 | `last_result` 维度为 customer_state，`bind_reference(category)` | `AMBIGUOUS` |
+| C12 | 没有 `last_result`，`bind_reference(category)` | `AMBIGUOUS` |
+| C13 | 比较类意图、当前为 Q2、`compare_to` 为空 | `compare_to` 为 2018-01-01 至 2018-04-01，新增一条 `default_declared` 口径 |
+| C14 | 当前为 Q2，`set_compare_to(year_over_year)` | 解析为 2017-04-01 至 2017-07-01，口径来源变为 `user_confirmed` |
+| C15 | `expects_single_entity` 为真，结果第一名并列 | `selected` 为空 |
+| C16 | 两个版本之间新增筛选、修改时间范围、删除对比期 | `context_update` 的 `added`、`changed`、`removed` 各一项 |
 
 ### 9.4 护栏（`tests/guard/`）
 
@@ -538,6 +631,7 @@ O1 另有一条付款记录 160（含运费），用于确认付款金额**不�
 | R4 | 按付款金额统计各类目销售额 | `INCOMPATIBLE`，不进入 SQL 路径 |
 | R5 | 上季度各类目的利润 | `OUT_OF_SCOPE` |
 | R6 | 本月销售额 | `OUT_OF_SCOPE`（数据不完整） |
+| R7 | 上季度哪个类目的销售额下降最多 | 指标路径，声明默认对比期，按 `delta` 升序 |
 
 路由测试依赖模型，作为评测用例运行（§10），不作为确定性单元测试。
 
@@ -562,7 +656,8 @@ O1 另有一条付款记录 160（含运费），用于确认付款金额**不�
 | `metric_covered` | 上个季度销售额最高的 5 个类目是什么？ | 指标路径，按类目分组，取前 5 |
 | `metric_covered` | 上个月圣保罗州的销售额是多少？ | 指标路径，筛选 SP |
 | `metric_covered` | 上季度哪个州的差评率最高？ | 指标路径，按客户州分组 |
-| `metric_covered` | 上季度和再上一季度相比，哪个类目的销售额增长最多？ | 指标路径，带 `compare_to` |
+| `metric_covered` | 上季度和再上一季度相比，哪个类目的销售额增长最多？ | 指标路径，带 `compare_to`，按 `delta` 降序 |
+| `metric_covered` | 上季度哪个类目的销售额下降最多？ | 指标路径，声明默认对比期，按 `delta` 升序 |
 | `metric_covered` | 2018 年第一季度 electronics 类目的差评率是多少？ | 指标路径，经桥接表，说明归属规则 |
 | `long_tail_sql` | 上个月平均每笔订单包含几件商品？ | SQL 路径 |
 | `long_tail_sql` | 上季度已签收订单的平均配送天数是多少？ | SQL 路径，使用 `delivered_ts - purchase_ts` |
@@ -574,17 +669,19 @@ O1 另有一条付款记录 160（含运费），用于确认付款金额**不�
 | `unsupported` | 哪个卖家州的销售额最高？ | `INCOMPATIBLE`：MVP 未定义卖家州维度 |
 | `unsupported` | 本月的销售额是多少？ | `OUT_OF_SCOPE`：本月数据不完整 |
 
-### 10.2 多轮对话（约 5 组）
+### 10.2 多轮对话（约 6 组）
 
-**D1 销售额：澄清、筛选、对比**
+**D1 销售额：默认对比期、筛选、改为同比**
 
 ```
 用户：上季度哪个类目的销售额下降最多？
-Agent：[声明销售额按商品金额统计；说明按付款金额拆分到类目不支持；请求确认]
+Agent：[声明销售额按商品金额统计、默认与再上一季度比较；说明按付款金额拆分到类目不支持；请求确认]
 用户：可以。
-Agent：[结果]
-用户：只看圣保罗州，和再上一季度比较。
-期望：set_filter(customer_state, [SP])；set_compare_to(previous_period)
+Agent：[结果；context_update 新增 compare_to（系统默认）]
+用户：只看圣保罗州。
+期望：set_filter(customer_state, [SP])
+用户：改成和去年同期比。
+期望：set_compare_to(year_over_year)，口径来源变为 user_confirmed；州筛选保留
 ```
 
 **D2 差评率：归属规则与排除**
@@ -608,12 +705,13 @@ Agent：[结果，说明空评分不计入分母]
 用户：不限州了。            期望：remove_filter(customer_state)
 ```
 
-**D4 指标路径到 SQL 路径**
+**D4 指代：单个实体，指标路径到 SQL 路径**
 
 ```
 用户：上季度销售额最高的类目是哪个？
+期望：last_result.selected 为第一名的类目
 用户：这个类目上季度平均每单买几件？
-期望：第二问为 NOT_COVERED，进入 SQL 路径，并沿用已确认的类目与时间范围
+期望：bind_reference(category) 解析为该类目；NOT_COVERED，进入 SQL 路径，沿用类目与时间范围；口径说明写明指代结果
 ```
 
 **D5 不支持的追问**
@@ -624,9 +722,20 @@ Agent：[结果，说明空评分不计入分母]
 期望：INCOMPATIBLE，不进入 SQL 路径；说明限制，保持原有结果与状态不变
 ```
 
+**D6 指代：多个候选时追问**
+
+```
+用户：上季度销售额前 5 的类目。
+期望：last_result 有 5 个实体，selected 为空
+用户：这个类目的差评率呢？
+期望：AMBIGUOUS，clarification 事件列出 5 个候选
+用户：[选择第 2 个]
+期望：bind_reference 解析为第 2 个类目，查询其差评率，口径说明写明归属规则
+```
+
 ### 10.3 冻结测试集
 
-- P0 结束前编写约 30 道单轮题（四个类别都要覆盖）和 5 组多轮对话；
+- P0 结束前编写约 30 道单轮题（四个类别都要覆盖）和 6 组多轮对话；
 - 编写完成后记录文件哈希到 `docs/experiments.md`，之后不修改；
 - 只在里程碑运行，不查看单题失败细节来调整提示词或规则。
 
@@ -637,21 +746,24 @@ Agent：[结果，说明空评分不计入分母]
 3. 语义层定义、编译器与 fixture 单元测试（§3、§4、§9.1–9.2）；
 4. 护栏与测试（§7、§9.4）；
 5. MCP 工具：`list_metrics`、`query_metric`、`describe_table`、`run_sql`；
-6. 对话状态与测试（§6、§9.3）；
+6. 对话状态与测试，含指代与比较基准（§6、§9.3）；
 7. LangGraph Agent：节点、路由、修错循环、可解释答案（§5）；
-8. FastAPI 接口与 SSE（§8）；
-9. Langfuse 追踪；
-10. 评测 harness 与开发集、多轮对话（§10）；
-11. 模型网关接入 API 模型与小模型推理端点，跑对照链步骤 1–2。
+8. FastAPI 接口与 SSE，含 `context_update`（§8.1–8.3）；
+9. Streamlit 演示界面（§8.4）；
+10. Langfuse 追踪；
+11. 评测 harness 与开发集、多轮对话（§10）；
+12. 模型网关接入 API 模型与小模型推理端点，跑对照链步骤 1–2。
 
 ## 12. 完成标准
 
-- [ ] `docker compose up` 一条命令启动全部服务；
+MVP 完成时达到 README §12 验收标准的第 1 条，并满足以下各项：
+
+- [ ] `docker compose up` 一条命令启动数据库、API 与演示界面；
 - [ ] 数据画像报告生成，所有假设的验证结果已记录，`REFERENCE_DATE` 已确定；
 - [ ] §9.2–9.4 的单元测试全部通过；
-- [ ] D1–D5 五组多轮对话端到端运行，`confirmed_context` 的更新符合期望；
+- [ ] D1–D6 六组多轮对话在演示界面上端到端运行，条件面板的变化与 `confirmed_context` 一致；
 - [ ] 开发集在 API 模型与小模型上各跑一遍，按题目类别输出结果；
 - [ ] 冻结测试集已编写并记录哈希；
 - [ ] Langfuse 中可以看到完整轨迹；
-- [ ] README §13 中 P0 的两个演示案例可以通过脚本复现；
+- [ ] README §13 中 P0 的三个演示案例可以通过脚本或界面复现，并录制演示视频；
 - [ ] 对照链步骤 1–2 的结果记录在 `docs/experiments.md`。
